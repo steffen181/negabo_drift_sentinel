@@ -1,0 +1,657 @@
+Die Idee ist: **jede Repo erzeugt nur ein kleines, anonymisiertes “Snip”-Artefakt**, und der PR-Check vergleicht dieses Snip gegen eine vorher kalibrierte Baseline. Rohdaten verlassen die Repo nicht.
+
+Ich habe den Code als kleines Drop-in-Projekt umgesetzt:
+
+[Projekt als ZIP herunterladen](sandbox:/mnt/data/drift_monitoring_pilot.zip)
+
+## Die Idee genau
+
+Es gibt zwei Phasen.
+
+### 1. Kalibrierung: “Was ist normal?”
+
+Du nimmst historische Metriken, zum Beispiel `monitoring/history/metrics.jsonl`, und baust daraus eine Baseline. Standard ist:
+
+```text
+letzte 30 Tage
+mindestens 30 Samples
+B = 2000 Bootstrap-Replikate
+```
+
+Für jede Metrik werden Drift-Grenzen kalibriert, zum Beispiel:
+
+```text
+mean_delta  = |aktueller Mittelwert - Baseline-Mittelwert|
+p95_delta   = |aktuelles p95 - Baseline-p95|
+psi         = Histogramm-Drift / Population Stability Index
+```
+
+Die Kalibrierung schreibt ein kleines Artefakt:
+
+```text
+pilot-calibration.json.gz
+```
+
+Darin stehen keine Rohdaten, sondern nur:
+
+```text
+Baseline-Summaries
+Histogramme
+Thresholds
+B
+Seed
+Hashes
+Schema-Version
+```
+
+### 2. PR-Check: “Ist dieser PR auffällig?”
+
+Im PR wird ein neues Snip erzeugt:
+
+```text
+pr-snip.json.gz
+```
+
+Dieses Snip enthält wieder keine Rohdaten, sondern nur kompakte Statistik:
+
+```text
+n, mean, std, Quantile, Histogramme
+optional: quantisierte Feature-Prototypen
+```
+
+Dann berechnet der PR-Check für jede Metrik eine konservative Unsicherheitsschätzung mit BCa-Bootstrap. Die Regel ist:
+
+```text
+Alarm, wenn ci_high > threshold
+```
+
+Also nicht: “Der Punktwert ist größer als der Grenzwert”, sondern konservativer:
+
+```text
+Die obere Konfidenzgrenze des Drift-Werts überschreitet den kalibrierten Grenzwert.
+```
+
+Das reduziert Zufallsalarme bei kleinen PR-Samples.
+
+---
+
+## Was ist implementiert?
+
+Im ZIP liegen diese Dateien:
+
+```text
+drift_monitoring_pilot/
+├── requirements.txt
+├── README.md
+├── tools/
+│   ├── drift_utils.py
+│   ├── make_prototype_snip.py
+│   ├── calibrate_bca.py
+│   └── pr_check.py
+└── .github/workflows/
+    ├── calibrate-thresholds.yml
+    └── pr-drift-check.yml
+```
+
+## Modul 1: `tools/drift_utils.py`
+
+Das ist die gemeinsame Kernbibliothek. Sie macht die ganze technische Basisarbeit.
+
+### Was sie macht
+
+Sie liest Metrikdaten aus:
+
+```text
+.jsonl
+.ndjson
+.csv
+```
+
+Beispiel für eine JSONL-Zeile:
+
+```json
+{"timestamp":"2026-06-14T12:00:00Z","error_rate":0.021,"latency_ms":142,"quality_score":0.88}
+```
+
+Sie extrahiert daraus numerische Felder, zum Beispiel:
+
+```text
+error_rate
+latency_ms
+quality_score
+nested.value
+```
+
+Zeitfelder wie `timestamp`, `created_at`, `date` werden als Zeitstempel behandelt und nicht als Metrik.
+
+### Zentrale Funktionen
+
+`make_numeric_snip(...)`
+
+Erzeugt pro Metrik kompakte Statistik:
+
+```text
+n
+mean
+std
+min
+max
+q01, q05, q25, q50, q75, q95, q99
+Histogramm mit Counts und Edges
+```
+
+Das ist die Grundlage für den PR-Vergleich.
+
+---
+
+`bca_interval(...)`
+
+Implementiert den **BCa-Bootstrap**:
+
+```text
+Bias-corrected and accelerated bootstrap confidence interval
+```
+
+Das Modul braucht kein SciPy. Es nutzt `statistics.NormalDist` aus der Standardbibliothek und `numpy`.
+
+Ergebnis ist zum Beispiel:
+
+```json
+{
+  "theta_hat": 0.012,
+  "ci_low": 0.007,
+  "ci_high": 0.019,
+  "B": 2000,
+  "seed": 12345,
+  "method": "bca"
+}
+```
+
+Wichtig ist im PR-Check vor allem:
+
+```text
+ci_high
+```
+
+Denn gegen diesen Wert wird geprüft.
+
+---
+
+`drift_numeric_from_snip(...)`
+
+Berechnet Drift zwischen aktuellem Snip und Baseline:
+
+```text
+mean_delta
+p95_delta
+psi
+```
+
+---
+
+`histogram_to_sample(...)`
+
+Da das PR-Snip keine Rohdaten enthält, rekonstruiert dieses Modul aus dem Histogramm eine kleine Pseudo-Stichprobe. Damit kann der PR-Check trotzdem ein Bootstrap-CI berechnen, ohne Rohdaten im Artefakt zu speichern.
+
+---
+
+`feature_snip_from_matrix(...)`
+
+Optional für Feature- oder Embedding-Daten.
+
+Es liest zum Beispiel:
+
+```text
+features.npy
+embeddings.npy
+features.csv
+JSONL mit "embedding", "features" oder "vector"
+```
+
+Dann erzeugt es kompakte Prototypen:
+
+```text
+k-Means-Centroids
+uint8-Quantisierung
+Assignment-Histogramm
+optionale Random Projection auf maximal 64 Dimensionen
+```
+
+Das ist die “PQ8-artige” Snip-Komponente: klein, quantisiert, keine Rohvektoren.
+
+---
+
+`feature_centroid_drift(...)`
+
+Vergleicht aktuelle quantisierte Prototypen mit der Baseline. Der Drift ist eine symmetrische durchschnittliche nächste-Centroid-Distanz.
+
+---
+
+`write_gzip_json(...)` und `read_gzip_json(...)`
+
+Schreiben und lesen kanonisches JSON mit gzip-Kompression. Außerdem werden SHA-256-Hashes berechnet.
+
+---
+
+## Modul 2: `tools/make_prototype_snip.py`
+
+Das ist der CLI-Befehl, der im PR läuft.
+
+### Aufgabe
+
+Aus Repo-lokalen Daten wird ein kleines Snip gebaut:
+
+```bash
+python tools/make_prototype_snip.py \
+  --input . \
+  --out artifacts/pr-snip.json.gz \
+  --max-bytes 32768
+```
+
+### Was genau passiert?
+
+Das Skript sucht automatisch nach monitoring-artigen Dateien, zum Beispiel:
+
+```text
+monitoring/metrics.jsonl
+monitoring/history/metrics.csv
+eval_scores.csv
+quality_metrics.jsonl
+```
+
+Dann filtert es, falls Zeitstempel vorhanden sind, auf das neueste Fenster:
+
+```text
+Standard: letzte 30 Tage
+```
+
+Danach erzeugt es pro Metrik:
+
+```text
+Summary Stats
+Quantile
+Histogramm
+```
+
+Optional sucht es nach Feature-Dateien wie:
+
+```text
+features.npy
+embeddings.npy
+vectors.jsonl
+```
+
+und erzeugt quantisierte Prototypen.
+
+### Datenschutz / Artefaktgröße
+
+Das Skript schreibt keine Rohdaten ins Artefakt.
+
+Es erzwingt außerdem:
+
+```text
+Hard Cap: 50 KiB
+Default Target: 32 KiB
+```
+
+Wenn das Snip größer ist, bricht es ab:
+
+```text
+Snip too large: ...
+Reduce --hist-bins, --feature-k or --feature-max-dim.
+```
+
+### Demo-Modus
+
+Zum Testen ohne echte Daten:
+
+```bash
+python tools/make_prototype_snip.py \
+  --demo \
+  --repo demo_repo \
+  --out artifacts/pr-snip.json.gz
+```
+
+---
+
+## Modul 3: `tools/calibrate_bca.py`
+
+Das ist der Kalibrierungsbefehl.
+
+### Aufgabe
+
+Aus historischen Daten wird eine Baseline plus Thresholds erzeugt:
+
+```bash
+python tools/calibrate_bca.py \
+  --repos "." \
+  --window-days 30 \
+  --min-samples 30 \
+  --B 2000 \
+  --out monitoring/pilot-calibration.json.gz
+```
+
+### Was genau passiert?
+
+Für jede Repo:
+
+1. Metrikdateien finden.
+2. Historische Rows laden.
+3. Latest-30d-Baseline bauen.
+4. Rolling Windows über die Historie bilden.
+5. Pro Metrik Driftwerte berechnen.
+6. Per BCa-Bootstrap konservative Thresholds bestimmen.
+7. Ergebnis als `pilot-calibration.json.gz` speichern.
+
+### Threshold-Logik
+
+Für jede Metrik werden aktuell diese Checks kalibriert:
+
+```text
+mean_delta
+p95_delta
+psi
+```
+
+Wenn genug Rolling Windows existieren, nutzt das Skript:
+
+```text
+BCa über historische Rolling-Window-Drifts
+```
+
+Wenn zu wenig historische Fenster existieren, nutzt es einen markierten Fallback:
+
+```text
+BCa über bootstrap sampling error der Baseline
+```
+
+Der Fallback ist im Artefakt explizit sichtbar:
+
+```json
+"method": "bca_over_bootstrap_sampling_error_fallback"
+```
+
+### Warum dieser Fallback?
+
+Bei einem Pilot mit wenig Historie hast du oft noch keine saubere Drift-Verteilung über viele Fenster. Dann ist es besser, konservativ aus der Baseline-Sampling-Varianz zu starten, statt gar keine Schwelle zu haben.
+
+### Feature-Kalibrierung
+
+Wenn Features vorhanden sind, kalibriert das Skript zusätzlich:
+
+```text
+centroid_drift
+```
+
+Dafür werden Feature-Prototypen aus Bootstrap-Samples gebaut und gegen die Feature-Baseline verglichen.
+
+---
+
+## Modul 4: `tools/pr_check.py`
+
+Das ist der PR-Gate.
+
+### Aufgabe
+
+Das Skript liest:
+
+```text
+pilot-calibration.json.gz
+pr-snip.json.gz
+```
+
+und entscheidet:
+
+```text
+PASS oder FAIL
+```
+
+Beispiel:
+
+```bash
+python tools/pr_check.py \
+  --calib monitoring/pilot-calibration.json.gz \
+  --snip artifacts/pr-snip.json.gz \
+  --report artifacts/pr-drift-report.json \
+  --markdown artifacts/pr-drift-report.md
+```
+
+### Was genau passiert?
+
+Für jede Metrik im PR-Snip:
+
+1. Passende Baseline aus der Kalibrierung suchen.
+2. Aktuellen Drift berechnen.
+3. Aus dem Histogramm eine Pseudo-Stichprobe rekonstruieren.
+4. BCa-Konfidenzintervall berechnen.
+5. Prüfen:
+
+```text
+ci_high > threshold
+```
+
+Wenn ja:
+
+```text
+alarm = true
+exit code = 1
+```
+
+Wenn nein:
+
+```text
+exit code = 0
+```
+
+### Report
+
+Das Skript schreibt einen JSON-Report und optional Markdown:
+
+```text
+artifacts/pr-drift-report.json
+artifacts/pr-drift-report.md
+```
+
+Der Markdown-Report sieht zum Beispiel so aus:
+
+```text
+metric        check        point      ci_high     threshold    alarm
+error_rate    mean_delta   0.001      0.002       0.004        false
+latency_ms    p95_delta    12.1       18.4        15.0         true
+```
+
+---
+
+## Schnelltest
+
+Nach dem Entpacken:
+
+```bash
+cd drift_monitoring_pilot
+pip install -r requirements.txt
+mkdir -p artifacts
+```
+
+Dann Demo-Kalibrierung:
+
+```bash
+python tools/calibrate_bca.py \
+  --demo \
+  --out artifacts/pilot-calibration.json.gz \
+  --B 500 \
+  --feature-B 50
+```
+
+Das erzeugt automatisch Demo-Historie unter:
+
+```text
+_demo_data/demo_repo
+```
+
+Dann PR-Snip aus derselben Demo-Repo bauen:
+
+```bash
+python tools/make_prototype_snip.py \
+  --input _demo_data/demo_repo \
+  --repo demo_repo \
+  --out artifacts/pr-snip.json.gz
+```
+
+Dann PR-Check:
+
+```bash
+python tools/pr_check.py \
+  --calib artifacts/pilot-calibration.json.gz \
+  --snip artifacts/pr-snip.json.gz \
+  --B 500
+```
+
+Ich habe diesen Smoke-Test ausgeführt. Ergebnis war `PASS`, und die Artefakte lagen bei ungefähr:
+
+```text
+pilot-calibration.json.gz  ~2.8 KB
+pr-snip.json.gz            ~2.2 KB
+```
+
+---
+
+## GitHub-Actions-Nutzung
+
+Im ZIP sind zwei Beispiel-Workflows enthalten.
+
+### Kalibrierung manuell starten
+
+```text
+.github/workflows/calibrate-thresholds.yml
+```
+
+Der Workflow erzeugt:
+
+```text
+artifacts/pilot-calibration.json.gz
+```
+
+Für den PR-Workflow ist es am einfachsten, diese Datei anschließend an eine bekannte Stelle zu legen, zum Beispiel:
+
+```text
+monitoring/pilot-calibration.json.gz
+```
+
+### PR-Check
+
+```text
+.github/workflows/pr-drift-check.yml
+```
+
+Der Workflow erwartet die Kalibrierung hier:
+
+```text
+monitoring/pilot-calibration.json.gz
+```
+
+Dann erzeugt er:
+
+```text
+artifacts/pr-snip.json.gz
+artifacts/pr-drift-report.json
+artifacts/pr-drift-report.md
+```
+
+und bricht mit Exit-Code `1` ab, wenn Drift gefunden wird.
+
+---
+
+## Wichtigste CLI-Parameter
+
+### Kalibrierung
+
+```bash
+python tools/calibrate_bca.py \
+  --repos "repo-a,repo-b,repo-c" \
+  --window-days 30 \
+  --min-samples 30 \
+  --B 2000 \
+  --seed 12345 \
+  --out monitoring/pilot-calibration.json.gz
+```
+
+Wichtig:
+
+```text
+--window-days     Rolling-Baseline-Fenster
+--min-samples     Mindestanzahl Samples pro Fenster
+--B               Bootstrap-Replikate
+--seed            Reproduzierbarkeit
+--hist-bins       Histogrammgröße
+--feature-k       Anzahl Feature-Prototypen
+--max-bytes       Artefaktgrößenlimit
+```
+
+### PR-Snip
+
+```bash
+python tools/make_prototype_snip.py \
+  --input . \
+  --out artifacts/pr-snip.json.gz \
+  --max-bytes 32768
+```
+
+### PR-Check
+
+```bash
+python tools/pr_check.py \
+  --calib monitoring/pilot-calibration.json.gz \
+  --snip artifacts/pr-snip.json.gz \
+  --report artifacts/pr-drift-report.json \
+  --markdown artifacts/pr-drift-report.md
+```
+
+---
+
+## Datenformat, das am besten passt
+
+Empfohlen:
+
+```text
+monitoring/history/metrics.jsonl
+```
+
+mit Zeilen wie:
+
+```json
+{"timestamp":"2026-06-14T12:00:00Z","error_rate":0.021,"latency_ms":142,"quality_score":0.88}
+```
+
+Für Embeddings optional:
+
+```text
+monitoring/history/features.npy
+```
+
+mit Shape:
+
+```text
+(n_samples, n_dimensions)
+```
+
+oder JSONL:
+
+```json
+{"timestamp":"2026-06-14T12:00:00Z","embedding":[0.12,-0.03,0.44]}
+```
+
+---
+
+## Was du direkt anpassen würdest
+
+Die aktuelle Implementierung monitoriert generisch alle numerischen Felder. In einer echten Pilot-Repo würde ich meist explizit festlegen, welche Metriken relevant sind, zum Beispiel:
+
+```text
+error_rate
+latency_ms
+quality_score
+test_failure_rate
+coverage_delta
+```
+
+Dafür kann man sehr einfach einen `--metric-allowlist`-Parameter ergänzen. Die jetzige Version ist bewusst generisch, damit sie ohne projektspezifische Anpassung läuft.
