@@ -1,0 +1,34 @@
+name: pr-drift-check
+on: pull_request
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compute snip and compare
+        env:
+          CALIB: monitoring/pilot-calibration.json.gz
+          CURRENT: monitoring/current
+        run: |
+          pip install -r requirements.txt
+          test -f "$CALIB" || (echo "Missing $CALIB. Commit the calibration artifact or download it before this step." && exit 2)
+          test -d "$CURRENT" || (echo "Missing $CURRENT. Generate current PR metrics/features before this step." && exit 2)
+          mkdir -p artifacts
+          python -u tools/make_prototype_snip.py \
+            --input "$CURRENT" \
+            --features "$CURRENT" \
+            --out artifacts/pr-snip.json.gz \
+            --max-bytes 32768
+          python -u tools/pr_check.py \
+            --calib "$CALIB" \
+            --snip artifacts/pr-snip.json.gz \
+            --report artifacts/pr-drift-report.json \
+            --markdown artifacts/pr-drift-report.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-drift-report
+          path: artifacts/

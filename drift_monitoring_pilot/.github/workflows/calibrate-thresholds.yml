@@ -1,0 +1,31 @@
+name: calibrate-thresholds
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated repo paths checked out into the runner"
+        required: false
+        default: "."
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Calibrate BCa thresholds
+        run: |
+          pip install -r requirements.txt
+          mkdir -p artifacts
+          python -u tools/calibrate_bca.py \
+            --repos "${{ github.event.inputs.repos }}" \
+            --history-input monitoring/history \
+            --window-days 30 \
+            --min-samples 30 \
+            --B 2000 \
+            --out artifacts/pilot-calibration.json.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pilot-calibration
+          path: artifacts/pilot-calibration.json.gz
